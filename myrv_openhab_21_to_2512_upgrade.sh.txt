@@ -1,0 +1,577 @@
+# Paste into an SSH shell on the Pi.
+#
+# Purpose:
+#   Upgrade the LCI / MyRV openHAB image from 2.1 to 2.5.12 while preserving
+#   the custom idsmyrv binding, the custom LCI cloud connector, and the known
+#   runtime fixes this project needed after the original upgrade.
+#
+# Compatibility:
+#   - Raspbian GNU/Linux 9 (stretch)
+#   - Bash 4.4
+#   - openHAB 2.1 -> 2.5.12
+#   - Java 8 / openhab2-addons 2.5.12
+#
+# Usage:
+#   1. Paste this whole file into a root shell on the Pi.
+#   2. Run:
+#        chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh
+#        /root/myrv_openhab_21_to_2512_upgrade.sh
+#   3. The script will stop for an explicit SD-card image and risk-acceptance confirmation before changing anything.
+
+cat > /root/myrv_openhab_21_to_2512_upgrade.sh <<'EOF'
+#!/bin/bash
+set -eu
+set -o pipefail
+
+log_ts() { date +"[%Y-%m-%d %H:%M:%S]"; }
+log()    { echo "$(log_ts) [INFO]  $*"; }
+warn()   { echo "$(log_ts) [WARN]  $*" >&2; }
+err()    { echo "$(log_ts) [ERR]   $*" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+  err "This script must be run as root."
+  exit 1
+fi
+
+print_operator_disclaimer() {
+  cat <<'DISCLAIMER'
+WARNING: This upgrade changes packages, service files, add-ons, cache directories, and live control-system behavior.
+
+Do not continue unless you have created and safely stored a full raw image of the Pi SD card.
+Without that raw image, box-specific OEM or cloud identifiers on the card may be difficult or impossible to recover.
+
+This script is provided AS IS, without warranty, and is used entirely at your own risk.
+This project and script are independent community work and are not affiliated with, endorsed by, or supported by Lippert Components, LCI, OneControl, MyRV, openHAB, SmartThings, Samsung, or the RV manufacturer.
+
+This warning is operational guidance only and is not legal advice.
+DISCLAIMER
+}
+
+require_operator_confirmation() {
+  local ANSWER
+
+  print_operator_disclaimer
+  echo
+  printf "Type YES if you have already made and saved a full raw SD-card image: "
+  read -r ANSWER
+  if [ "${ANSWER}" != "YES" ]; then
+    err "Operator did not confirm that a full raw SD-card image exists. Aborting."
+    exit 1
+  fi
+
+  printf "Type I ACCEPT ALL RISK to continue with the upgrade: "
+  read -r ANSWER
+  if [ "${ANSWER}" != "I ACCEPT ALL RISK" ]; then
+    err "Operator did not accept the upgrade disclaimer. Aborting."
+    exit 1
+  fi
+}
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_ROOT="/root/rvsi-restorepoints/${TS}-openhab-21-to-2512-upgrade"
+OH_CONF="/etc/openhab2"
+OH_SERVICES="${OH_CONF}/services"
+OH_USERDATA="/var/lib/openhab2"
+OH_ADDONS="/usr/share/openhab2/addons"
+OH_LOGDIR="/var/log/openhab2"
+OH_LIST="/etc/apt/sources.list.d/openhab2.list"
+OH_ADDONS_CFG="${OH_SERVICES}/addons.cfg"
+OH_CLOUD_CFG="${OH_SERVICES}/openhabcloud.cfg"
+MONIT_CFG="/etc/myrvcg/monit.cfg"
+CUSTOM_STAGE="${BACKUP_ROOT}/custom-addons"
+QUARANTINE_DIR="${BACKUP_ROOT}/addons-quarantine"
+WAIT_TIMEOUT=180
+POST_OPENHAB_SETTLE=120
+IDSMYRV_WAIT_TIMEOUT=300
+MONIT_WATCHDOG_MANAGED=0
+trap 'restore_monit_openhab_watchdog_reboot || true' EXIT
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    err "Required command not found: $1"
+    exit 1
+  fi
+}
+
+backup_file() {
+  local SRC="$1"
+  local REL="$2"
+  local DST
+  DST="${BACKUP_ROOT}/${REL}"
+  if [ -e "${SRC}" ]; then
+    mkdir -p "$(dirname "${DST}")"
+    cp -a "${SRC}" "${DST}"
+  fi
+}
+
+backup_dir_tar() {
+  local SRC="$1"
+  local TAR_NAME="$2"
+  if [ -e "${SRC}" ]; then
+    tar -czf "${BACKUP_ROOT}/${TAR_NAME}" "${SRC}" 2>/dev/null || \
+      warn "Backup of ${SRC} had warnings; continuing."
+  fi
+}
+
+find_one() {
+  local ROOT="$1"
+  local DEPTH="$2"
+  local PATTERN="$3"
+  find "${ROOT}" -maxdepth "${DEPTH}" -type f -name "${PATTERN}" 2>/dev/null | head -n 1 || true
+}
+
+wait_for_rest() {
+  local I
+  I=0
+  while [ "${I}" -lt "${WAIT_TIMEOUT}" ]; do
+    if curl -fsS http://127.0.0.1:8080/rest/ >/dev/null 2>&1; then
+      return 0
+    fi
+    I=$((I + 1))
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_idsmyrv() {
+  local I
+  I=0
+  while [ "${I}" -lt "${IDSMYRV_WAIT_TIMEOUT}" ]; do
+    if curl -fsS http://127.0.0.1:8080/rest/things 2>/dev/null | grep -q 'idsmyrv:'; then
+      return 0
+    fi
+    if curl -fsS http://127.0.0.1:8080/rest/items 2>/dev/null | grep -q '"name":"idsmyrv_'; then
+      return 0
+    fi
+    I=$((I + 1))
+    sleep 1
+  done
+  return 1
+}
+
+restart_monit_if_present() {
+  if [ -x /etc/init.d/monit ] || systemctl cat monit >/dev/null 2>&1; then
+    systemctl restart monit || warn "Failed to restart monit after config adjustment."
+  else
+    warn "monit.service was not found after config adjustment."
+  fi
+}
+
+restart_myrv_if_present() {
+  if systemctl cat myrv.service >/dev/null 2>&1; then
+    log "Restarting myrv.service after openHAB restart."
+    systemctl restart myrv.service || warn "Failed to restart myrv.service."
+  else
+    warn "myrv.service unit was not found."
+  fi
+}
+
+restart_openhab_and_wait() {
+  local LABEL="$1"
+
+  log "${LABEL}"
+  systemctl restart openhab2
+
+  if ! wait_for_rest; then
+    err "openHAB REST did not come back within ${WAIT_TIMEOUT} seconds."
+    exit 1
+  fi
+}
+
+rewrite_monit_openhab_watchdog() {
+  local TARGET_LINE="$1"
+  local LABEL="$2"
+  local TARGET_LINE_ESCAPED
+
+  if [ ! -f "${MONIT_CFG}" ]; then
+    log "Monit config not present; skipping Monit watchdog adjustment."
+    return 1
+  fi
+
+  if grep -qF "${TARGET_LINE}" "${MONIT_CFG}" 2>/dev/null; then
+    log "Monit openHAB CPU watchdog already set to ${LABEL}."
+    return 0
+  fi
+
+  if ! grep -Eq 'if total cpu > (50|65)% for 20 cycles then (exec "/sbin/reboot"|alert)' "${MONIT_CFG}" 2>/dev/null; then
+    warn "Expected Monit openHAB CPU watchdog pattern not found in ${MONIT_CFG}; leaving file unchanged."
+    return 1
+  fi
+
+  log "Setting Monit openHAB CPU watchdog to ${LABEL}."
+  cp -a "${MONIT_CFG}" "${MONIT_CFG}.bak.${TS}"
+  TARGET_LINE_ESCAPED="$(printf '%s\n' "${TARGET_LINE}" | sed 's/[\/&]/\\&/g')"
+  sed \
+    -e "s/if total cpu > 50% for 20 cycles then exec \"\\/sbin\\/reboot\"/${TARGET_LINE_ESCAPED}/" \
+    -e "s/if total cpu > 65% for 20 cycles then exec \"\\/sbin\\/reboot\"/${TARGET_LINE_ESCAPED}/" \
+    -e "s/if total cpu > 50% for 20 cycles then alert/${TARGET_LINE_ESCAPED}/" \
+    -e "s/if total cpu > 65% for 20 cycles then alert/${TARGET_LINE_ESCAPED}/" \
+    "${MONIT_CFG}" > "${MONIT_CFG}.new"
+
+  if command -v monit >/dev/null 2>&1; then
+    mv "${MONIT_CFG}.new" "${MONIT_CFG}"
+    if ! monit -t >/dev/null 2>&1; then
+      cp -a "${MONIT_CFG}.bak.${TS}" "${MONIT_CFG}"
+      rm -f "${MONIT_CFG}.bak.${TS}"
+      rm -f "${MONIT_CFG}.new"
+      err "Updated Monit config failed validation."
+      exit 1
+    fi
+  else
+    mv "${MONIT_CFG}.new" "${MONIT_CFG}"
+  fi
+
+  rm -f "${MONIT_CFG}.bak.${TS}"
+
+  restart_monit_if_present
+  return 0
+}
+
+set_monit_openhab_watchdog_alert() {
+  if rewrite_monit_openhab_watchdog 'if total cpu > 65% for 20 cycles then alert' 'alert at 65%'; then
+    MONIT_WATCHDOG_MANAGED=1
+  fi
+}
+
+restore_monit_openhab_watchdog_reboot() {
+  if [ "${MONIT_WATCHDOG_MANAGED}" -ne 1 ]; then
+    return 0
+  fi
+
+  if rewrite_monit_openhab_watchdog 'if total cpu > 65% for 20 cycles then exec "/sbin/reboot"' 'reboot at 65%'; then
+    MONIT_WATCHDOG_MANAGED=0
+  else
+    warn "Unable to restore the Monit openHAB CPU watchdog to reboot at 65%."
+  fi
+}
+
+normalize_addons_cfg() {
+  local SRC="$1"
+  local TMP="$2"
+  awk '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    function append_unique(name) {
+      if (name == "") {
+        return
+      }
+      if (!(name in seen)) {
+        seen[name] = 1
+        order[++count] = name
+      }
+    }
+    function build_ui(raw,   n, a, i, item, out) {
+      delete seen
+      delete order
+      count = 0
+      raw = trim(raw)
+      gsub(/[ \t]/, "", raw)
+      n = split(raw, a, ",")
+      for (i = 1; i <= n; i++) {
+        item = a[i]
+        if (item == "" || item == "classic") {
+          continue
+        }
+        append_unique(item)
+      }
+      append_unique("basic")
+      append_unique("habmin")
+      append_unique("habpanel")
+      append_unique("paper")
+      append_unique("restdocs")
+      out = ""
+      for (i = 1; i <= count; i++) {
+        out = out ((out == "") ? "" : ",") order[i]
+      }
+      return out
+    }
+    function build_binding(raw,   n, a, i, item, out) {
+      delete seen
+      delete order
+      count = 0
+      raw = trim(raw)
+      gsub(/[ \t]/, "", raw)
+      n = split(raw, a, ",")
+      for (i = 1; i <= n; i++) {
+        item = a[i]
+        if (item == "") {
+          continue
+        }
+        append_unique(item)
+      }
+      append_unique("mqtt")
+      out = ""
+      for (i = 1; i <= count; i++) {
+        out = out ((out == "") ? "" : ",") order[i]
+      }
+      return out
+    }
+    function build_misc(raw,   n, a, i, item, out) {
+      delete seen
+      delete order
+      count = 0
+      raw = trim(raw)
+      gsub(/[ \t]/, "", raw)
+      n = split(raw, a, ",")
+      for (i = 1; i <= n; i++) {
+        item = a[i]
+        if (item == "" || item == "restdocs" || item == "openhabcloud") {
+          continue
+        }
+        append_unique(item)
+      }
+      out = ""
+      for (i = 1; i <= count; i++) {
+        out = out ((out == "") ? "" : ",") order[i]
+      }
+      return out
+    }
+    BEGIN {
+      saw_package = 0
+      saw_binding = 0
+      saw_ui = 0
+      saw_misc = 0
+    }
+    {
+      if ($0 ~ /^[ \t]*package[ \t]*=/) {
+        saw_package = 1
+        print "package = minimal"
+        next
+      }
+      if ($0 ~ /^[ \t]*binding[ \t]*=/) {
+        saw_binding = 1
+        print "binding = " build_binding(substr($0, index($0, "=") + 1))
+        next
+      }
+      if ($0 ~ /^[ \t]*ui[ \t]*=/) {
+        saw_ui = 1
+        print "ui = " build_ui(substr($0, index($0, "=") + 1))
+        next
+      }
+      if ($0 ~ /^[ \t]*misc[ \t]*=/) {
+        saw_misc = 1
+        print "misc = " build_misc(substr($0, index($0, "=") + 1))
+        next
+      }
+      print
+    }
+    END {
+      if (!saw_package) {
+        print "package = minimal"
+      }
+      if (!saw_binding) {
+        print "binding = mqtt"
+      }
+      if (!saw_ui) {
+        print "ui = basic,habmin,habpanel,paper,restdocs"
+      }
+      if (!saw_misc) {
+        print "misc = "
+      }
+    }
+  ' "${SRC}" > "${TMP}"
+}
+
+log "Starting LCI / MyRV openHAB 2.1 -> 2.5.12 upgrade with preserved custom addons."
+
+require_operator_confirmation
+
+require_cmd dpkg
+require_cmd apt-get
+require_cmd awk
+require_cmd grep
+require_cmd sed
+require_cmd tar
+require_cmd find
+require_cmd systemctl
+
+mkdir -p "${BACKUP_ROOT}" "${CUSTOM_STAGE}" "${QUARANTINE_DIR}"
+ln -sfn "${BACKUP_ROOT}" /root/rvsi-last-upgrade-backup
+
+log "Creating backup snapshot in ${BACKUP_ROOT}"
+backup_dir_tar "${OH_CONF}" "openhab2-conf.tar.gz"
+backup_dir_tar "${OH_USERDATA}" "openhab2-userdata.tar.gz"
+backup_dir_tar "${OH_ADDONS}" "openhab2-addons.tar.gz"
+backup_dir_tar "${OH_LOGDIR}" "openhab2-logs.tar.gz"
+backup_dir_tar "/mnt/cfile" "mnt-cfile.tar.gz"
+backup_file "/usr/lib/systemd/system/myrv.service" "systemd/myrv.service"
+backup_file "${MONIT_CFG}" "myrvcg/monit.cfg"
+backup_file "${OH_ADDONS_CFG}" "services/addons.cfg"
+backup_file "${OH_CLOUD_CFG}" "services/openhabcloud.cfg"
+dpkg -l > "${BACKUP_ROOT}/dpkg-list.txt" || warn "Failed to dump dpkg package list."
+mount > "${BACKUP_ROOT}/mounts.txt" || warn "Failed to dump mount table."
+systemctl status openhab2 > "${BACKUP_ROOT}/openhab2-status.txt" 2>&1 || true
+systemctl status myrv.service > "${BACKUP_ROOT}/myrv-status.txt" 2>&1 || true
+
+if ! mount | grep -q " on /mnt/cfile "; then
+  warn "/mnt/cfile is not mounted. myrv.service may still be starting."
+fi
+
+set_monit_openhab_watchdog_alert
+
+if dpkg -s myrvcg >/dev/null 2>&1; then
+  STATUS="/var/lib/dpkg/status"
+  STATUS_BAK="${BACKUP_ROOT}/dpkg-status.before-edit"
+  cp "${STATUS}" "${STATUS_BAK}"
+  log "Relaxing the myrvcg openhab2 dependency in dpkg status."
+  awk '
+    BEGIN { inpkg = 0 }
+    /^Package: / {
+      inpkg = ($2 == "myrvcg")
+    }
+    {
+      if (inpkg && $0 ~ /openhab2 *\(/) {
+        gsub(/\(.*\)/, "", $0)
+      }
+      print $0
+    }
+  ' "${STATUS}" > /tmp/status.new
+  mv /tmp/status.new "${STATUS}"
+else
+  warn "myrvcg package not found. Continuing without the dependency relaxation step."
+fi
+
+EXISTING_IDSMYRV="$(find_one "${OH_ADDONS}" 1 'org.openhab.binding.idsmyrv-*.jar')"
+CFILE_IDSMYRV="$(find_one /mnt/cfile 7 'org.openhab.binding.idsmyrv-*.jar')"
+if [ -n "${EXISTING_IDSMYRV}" ]; then
+  cp -p "${EXISTING_IDSMYRV}" "${CUSTOM_STAGE}/"
+elif [ -n "${CFILE_IDSMYRV}" ]; then
+  cp -p "${CFILE_IDSMYRV}" "${CUSTOM_STAGE}/"
+else
+  warn "Custom idsmyrv binding JAR was not found in addons or /mnt/cfile."
+fi
+
+EXISTING_CLOUD="$(find_one "${OH_ADDONS}" 1 'org.openhab.io.openhabcloud-2.3.0-SNAPSHOT.jar')"
+CFILE_CLOUD="$(find_one /mnt/cfile 7 'org.openhab.io.openhabcloud-2.3.0-SNAPSHOT.jar')"
+if [ -n "${EXISTING_CLOUD}" ]; then
+  cp -p "${EXISTING_CLOUD}" "${CUSTOM_STAGE}/"
+elif [ -n "${CFILE_CLOUD}" ]; then
+  cp -p "${CFILE_CLOUD}" "${CUSTOM_STAGE}/"
+else
+  warn "Custom openhabcloud snapshot JAR was not found in addons or /mnt/cfile."
+fi
+
+log "Refreshing APT metadata."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y || warn "Initial apt-get update had warnings."
+apt-get install -y apt-transport-https ca-certificates curl gnupg || \
+  warn "Install of HTTPS prerequisites had warnings."
+require_cmd curl
+
+echo "deb https://openhab.jfrog.io/artifactory/openhab-linuxpkg stable main" > "${OH_LIST}"
+
+if curl -fsSL "https://openhab.jfrog.io/artifactory/api/gpg/key/public" | apt-key add - >/dev/null 2>&1; then
+  log "openHAB JFrog key added."
+else
+  warn "APT key refresh failed. Legacy fallback may require an unauthenticated install."
+fi
+
+apt-get update -y || warn "openHAB repo update had warnings."
+
+SIM_OUT="$(apt-get -s install openhab2=2.5.12-1 openhab2-addons=2.5.12-1 2>&1 || true)"
+printf '%s\n' "${SIM_OUT}" > "${BACKUP_ROOT}/apt-simulate.txt"
+if echo "${SIM_OUT}" | grep -q "Remv myrvcg"; then
+  err "Simulation still wants to remove myrvcg. Review ${BACKUP_ROOT}/apt-simulate.txt before proceeding."
+  exit 1
+fi
+
+log "Installing openhab2=2.5.12-1 and openhab2-addons=2.5.12-1"
+if ! apt-get install -y -o Dpkg::Options::=--force-confold openhab2=2.5.12-1 openhab2-addons=2.5.12-1; then
+  warn "Signed install failed. Retrying with --allow-unauthenticated for the legacy repo."
+  apt-get install -y --allow-unauthenticated -o Dpkg::Options::=--force-confold openhab2=2.5.12-1 openhab2-addons=2.5.12-1
+fi
+
+log "Quarantining custom-addon collisions and backup jars out of ${OH_ADDONS}"
+find "${OH_ADDONS}" -maxdepth 1 -type f \
+  \( -name 'org.openhab.io.openhabcloud-*.jar' -o -name 'org.openhab.binding.idsmyrv-*.jar' -o -name '*.bak.*' -o -name '*.disabled.*' \) \
+  -exec mv -f {} "${QUARANTINE_DIR}/" \;
+
+if ls "${CUSTOM_STAGE}"/org.openhab.binding.idsmyrv-*.jar >/dev/null 2>&1; then
+  cp -p "${CUSTOM_STAGE}"/org.openhab.binding.idsmyrv-*.jar "${OH_ADDONS}/"
+else
+  warn "No staged idsmyrv JAR to restore into addons."
+fi
+
+if ls "${CUSTOM_STAGE}"/org.openhab.io.openhabcloud-2.3.0-SNAPSHOT.jar >/dev/null 2>&1; then
+  cp -p "${CUSTOM_STAGE}"/org.openhab.io.openhabcloud-2.3.0-SNAPSHOT.jar "${OH_ADDONS}/"
+else
+  warn "No staged custom openhabcloud snapshot JAR to restore into addons."
+fi
+
+chown openhab:openhab "${OH_ADDONS}"/org.openhab.binding.idsmyrv-*.jar 2>/dev/null || true
+chown openhab:openhab "${OH_ADDONS}"/org.openhab.io.openhabcloud-2.3.0-SNAPSHOT.jar 2>/dev/null || true
+
+if [ -f "${OH_CLOUD_CFG}" ]; then
+  log "Disabling ${OH_CLOUD_CFG} to avoid reactivating stock openhabcloud."
+  mv "${OH_CLOUD_CFG}" "${BACKUP_ROOT}/openhabcloud.cfg.disabled"
+fi
+
+if [ -f "${OH_ADDONS_CFG}" ]; then
+  log "Normalizing addons.cfg so package is minimal, mqtt stays in binding, stock basic/paper/habmin/habpanel UIs plus restdocs stay under ui, classic stays out, and openhabcloud stays out of misc."
+  cp -a "${OH_ADDONS_CFG}" "${BACKUP_ROOT}/addons.cfg.before-normalize"
+  normalize_addons_cfg "${OH_ADDONS_CFG}" "${OH_ADDONS_CFG}.new"
+  mv "${OH_ADDONS_CFG}.new" "${OH_ADDONS_CFG}"
+else
+  log "Creating minimal addons.cfg with stock UI-safe defaults."
+  cat > "${OH_ADDONS_CFG}" <<'CFG'
+package = minimal
+binding = mqtt
+persistence =
+action =
+ui = basic,habmin,habpanel,paper,restdocs
+misc =
+voice =
+CFG
+fi
+
+if [ -d "${OH_USERDATA}/cache" ]; then
+  mv "${OH_USERDATA}/cache" "${OH_USERDATA}/cache.pre-upgrade.${TS}"
+fi
+if [ -d "${OH_USERDATA}/tmp" ]; then
+  mv "${OH_USERDATA}/tmp" "${OH_USERDATA}/tmp.pre-upgrade.${TS}"
+fi
+mkdir -p "${OH_USERDATA}/cache" "${OH_USERDATA}/tmp"
+chown -R openhab:openhab "${OH_USERDATA}/cache" "${OH_USERDATA}/tmp"
+
+restart_openhab_and_wait "Restarting openHAB."
+
+log "Allowing openHAB post-upgrade provisioning to settle for ${POST_OPENHAB_SETTLE} seconds."
+sleep "${POST_OPENHAB_SETTLE}"
+
+restart_openhab_and_wait "Performing final openHAB restart after post-upgrade provisioning."
+
+restart_myrv_if_present
+
+if wait_for_idsmyrv; then
+  log "idsmyrv bindings/items are visible through REST."
+else
+  warn "idsmyrv Things or Items did not appear after the first myrv.service restart; retrying once."
+  restart_myrv_if_present
+  if wait_for_idsmyrv; then
+    log "idsmyrv bindings/items are visible through REST after the retry."
+  else
+    warn "idsmyrv Things or Items did not appear within ${IDSMYRV_WAIT_TIMEOUT} seconds after the retry."
+  fi
+fi
+
+restore_monit_openhab_watchdog_reboot
+
+log "Validation summary:"
+systemctl is-active openhab2 || true
+systemctl is-active mosquitto || true
+systemctl is-active myrv.service || true
+curl -fsS http://127.0.0.1:8080/rest/ >/dev/null 2>&1 && log "REST is responding on 127.0.0.1:8080"
+find "${OH_ADDONS}" -maxdepth 1 -type f \( -name '*.bak.*' -o -name '*.disabled.*' \) -print
+
+log "Upgrade script completed."
+log "Backups and quarantined files are under: ${BACKUP_ROOT}"
+log "Rollback notes:"
+log "  - restore ${BACKUP_ROOT}/openhab2-conf.tar.gz and ${BACKUP_ROOT}/openhab2-userdata.tar.gz if needed"
+log "  - restore ${BACKUP_ROOT}/services/openhabcloud.cfg if you intentionally want the stock cloud path again"
+log "  - restore ${BACKUP_ROOT}/myrvcg/monit.cfg if you need the previous Monit CPU watchdog"
+EOF
+
+chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh

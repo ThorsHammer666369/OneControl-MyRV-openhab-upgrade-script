@@ -1,0 +1,376 @@
+# Paste into ssh term on pi
+
+cat > /root/myrv_openhab_21_to_2512_upgrade.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+log_ts() { date +"[%Y-%m-%d %H:%M:%S]"; }
+log()    { echo "$(log_ts) [INFO]  $*"; }
+warn()   { echo "$(log_ts) [WARN]  $*" >&2; }
+err()    { echo "$(log_ts) [ERR]   $*" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+  err "This script must be run as root (use sudo)."
+  exit 1
+fi
+
+log "LCI MyRV / openHAB 2.1 -> 2.5.12 upgrade (Option 2: preserve myrvcg + MyRV + HomeKit)."
+
+# -------------------------------
+# 0. Basic sanity checks
+# -------------------------------
+if ! command -v dpkg >/dev/null 2>&1; then
+  err "dpkg not found. This does not look like a normal Debian/Raspbian system."
+  exit 1
+fi
+
+if ! dpkg -s openhab2 >/dev/null 2>&1; then
+  warn "openhab2 package not found via dpkg. Are you sure this is the original LCI MyRV image?"
+else
+  log "openhab2 package detected."
+fi
+
+if dpkg -s myrvcg >/dev/null 2>&1; then
+  log "myrvcg package detected."
+else
+  warn "myrvcg package NOT detected. The vendor gateway may not be installed; MyRV cloud/app might not work even after upgrade."
+fi
+
+if mount | grep -q " on /mnt/cfile "; then
+  log "/mnt/cfile appears to be mounted (good; vendor payload is live)."
+else
+  warn "/mnt/cfile is NOT mounted. myrvcg may not be running yet or this image is different than expected."
+fi
+
+# -------------------------------
+# 1. Full backup snapshot
+# -------------------------------
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_ROOT="/root/lci_full_backup_${TS}"
+log "Creating full backup snapshot under: ${BACKUP_ROOT}"
+mkdir -p "${BACKUP_ROOT}"
+
+# Keep a stable symlink to the latest backup
+ln -sfn "${BACKUP_ROOT}" /root/lci_full_backup
+
+backup_dir() {
+  local SRC="$1"
+  local TAR="$2"
+  if [ -e "$SRC" ]; then
+    log "Backing up ${SRC} -> ${BACKUP_ROOT}/${TAR}"
+    tar -czf "${BACKUP_ROOT}/${TAR}" "$SRC" 2>/dev/null || \
+      warn "Backup of ${SRC} had some warnings (permissions or sockets), continuing."
+  else
+    warn "Skipping backup of ${SRC}; path does not exist."
+  fi
+}
+
+backup_dir "/etc/openhab2"          "openhab2_conf.tar.gz"
+backup_dir "/var/lib/openhab2"      "openhab2_userdata.tar.gz"
+backup_dir "/usr/share/openhab2"    "openhab2_runtime.tar.gz"
+backup_dir "/var/log/openhab2"      "openhab2_logs.tar.gz"
+backup_dir "/opt"                   "opt.tar.gz"
+backup_dir "/mnt/cfile"             "mnt_cfile.tar.gz"
+backup_dir "/etc/udev/rules.d"      "udev_rules.tar.gz"
+backup_dir "/root/homekit"          "homekit.tar.gz"
+
+log "Saving dpkg list, mounts, and filesystem map..."
+dpkg -l > "${BACKUP_ROOT}/dpkg_list.txt" || warn "Failed to dump dpkg list."
+mount  > "${BACKUP_ROOT}/mounts.txt"    || warn "Failed to dump mount table."
+find / -xdev -maxdepth 6 -printf "%p %u:%g %m %s\n" 2>/dev/null \
+  > "${BACKUP_ROOT}/filesystem_map.txt" || warn "Failed to build filesystem map (some paths may be unreadable)."
+
+log "Backup snapshot complete: ${BACKUP_ROOT}"
+
+# -------------------------------
+# 2. Background keyword scanner (4 threads)
+# -------------------------------
+if command -v python3 >/dev/null 2>&1; then
+  SCANNER_PY="/root/homekit_myrv_scanner.py"
+  log "Writing parallel keyword scanner to ${SCANNER_PY}"
+
+  cat > "${SCANNER_PY}" <<'PY'
+#!/usr/bin/env python3
+import os, sys, time, threading, queue
+
+KEYWORDS = [b"myrvcg", b"MyRV", b"openhab", b"openHAB", b"homekit", b"rv-homekit", b"idsmyrv"]
+NUM_WORKERS = 4
+
+if len(sys.argv) < 2:
+    # Changed f-string to .format()
+    print("Usage: homekit_myrv_scanner.py <root_dir>".format(), file=sys.stderr)
+    sys.exit(1)
+
+root_dir = sys.argv[1]
+file_queue = queue.Queue()
+matches = []
+scanned = 0
+lock = threading.Lock()
+
+# Pre-enqueue files
+for dirpath, dirnames, filenames in os.walk(root_dir):
+    for fname in filenames:
+        full = os.path.join(dirpath, fname)
+        file_queue.put(full)
+
+total = file_queue.qsize()
+start = time.time()
+
+def worker(idx):
+    global scanned
+    while True:
+        try:
+            path = file_queue.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+                for kw in KEYWORDS:
+                    if kw in blob:
+                        with lock:
+                            matches.append((path, kw.decode("utf-8", "ignore")))
+        except Exception:
+            pass
+        finally:
+            with lock:
+                scanned += 1
+                if scanned % 200 == 0 or scanned == total:
+                    elapsed = time.time() - start
+                    pct = (scanned / total * 100.0) if total else 100.0
+                    # Changed f-string to .format()
+                    print("[SCANNER] {}/{} files ({:0.1f}%) in {:0.1f}s".format(scanned, total, pct, elapsed), flush=True)
+            file_queue.task_done()
+
+threads = []
+for i in range(NUM_WORKERS):
+    t = threading.Thread(target=worker, args=(i,), daemon=True)
+    t.start()
+    threads.append(t)
+
+for t in threads:
+    t.join()
+
+# Changed f-string to .format()
+out = os.path.join(root_dir, "homekit_myrv_scan_{}.txt".format(int(start)))
+with open(out, "w", encoding="utf-8") as f:
+    # Changed f-strings to .format()
+    f.write("# homekit / MyRV / openHAB keyword scan\n".format())
+    f.write("# root = {}\n".format(root_dir))
+    f.write("# time = {}\n\n".format(time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(start))))
+    for path, kw in matches:
+        f.write("{}: {}\n".format(kw, path))
+# Changed f-string to .format()
+print("[SCANNER] Done. Matches written to {}".format(out))
+
+PY
+
+  chmod +x "${SCANNER_PY}"
+  SCAN_LOG="/root/homekit_myrv_scanner_${TS}.log"
+  log "Starting background scanner on ${BACKUP_ROOT} (4 threads)..."
+  nohup python3 "${SCANNER_PY}" "${BACKUP_ROOT}" >"${SCAN_LOG}" 2>&1 &
+  log "Scanner running as PID $!; log: ${SCAN_LOG}"
+else
+  warn "python3 not found; skipping keyword scanner."
+fi
+
+# -------------------------------
+# 3. Relax myrvcg dependency on openhab2 (dpkg status hack)
+# -------------------------------
+if dpkg -s myrvcg >/dev/null 2>&1; then
+  STATUS="/var/lib/dpkg/status"
+  STATUS_BAK="${STATUS}.bak_${TS}"
+  log "Backing up dpkg status to ${STATUS_BAK} before editing myrvcg stanza..."
+  cp "${STATUS}" "${STATUS_BAK}"
+
+  log "Relaxing myrvcg dependency on openhab2 (removing strict version constraint)..."
+  awk '
+    BEGIN{inpkg=0}
+    /^Package: /{
+      if ($2 == "myrvcg") { inpkg=1 } else { inpkg=0 }
+    }
+    {
+      if (inpkg && ($0 ~ /openhab2 *\(/)) {
+        # Remove version constraint: openhab2 (<= 2.1.0-1) -> openhab2
+        gsub(/\(.*\)/, "", $0)
+      }
+      print $0
+    }
+  ' "${STATUS}" > /tmp/status.new
+
+  mv /tmp/status.new "${STATUS}"
+  log "dpkg status updated for myrvcg."
+else
+  warn "myrvcg not installed; skipping dpkg status tweak."
+fi
+
+# -------------------------------
+# 4. Prepare APT + openHAB repo
+# -------------------------------
+export DEBIAN_FRONTEND=noninteractive
+
+log "Running initial apt-get update..."
+apt-get update -y || warn "apt-get update had warnings (old repos are common)."
+
+log "Ensuring HTTPS / crypto tools (apt-transport-https, ca-certificates, gnupg, wget)..."
+apt-get install -y apt-transport-https ca-certificates gnupg wget || \
+  warn "Install of HTTPS tools had issues; continuing."
+
+OH_LIST="/etc/apt/sources.list.d/openhab2.list"
+if [ ! -f "${OH_LIST}" ]; then
+  log "Creating openHAB APT source at ${OH_LIST}"
+  echo "deb https://openhab.jfrog.io/artifactory/openhab-linuxpkg stable main" > "${OH_LIST}"
+else
+  log "openHAB APT source already present at ${OH_LIST}"
+fi
+
+log "Adding / refreshing openHAB APT key (JFrog)..."
+if wget -qO- "https://openhab.jfrog.io/artifactory/api/security/keypair/public/repositories/Release" | apt-key add - >/dev/null 2>&1; then
+  log "openHAB APT key added."
+else
+  warn "Failed to add openHAB APT key; will allow unauthenticated packages to work around expired key."
+fi
+
+log "Running apt-get update against openHAB repo..."
+apt-get update -y || warn "apt-get update had warnings (likely due to old / unsigned repo)."
+
+# -------------------------------
+# 5. Simulate upgrade to verify myrvcg is not removed
+# -------------------------------
+log "Simulating install of openhab2=2.5.12-1 and openhab2-addons=2.5.12-1..."
+SIM_OUT="$(apt-get -s install openhab2=2.5.12-1 openhab2-addons=2.5.12-1 2>&1 || true)"
+
+if echo "${SIM_OUT}" | grep -q "Remv myrvcg"; then
+  warn "Simulation STILL wants to remove myrvcg. The dpkg status tweak may not have worked."
+  warn "Simulation output:"
+  echo "${SIM_OUT}"
+  warn "You can abort now with Ctrl+C if you do NOT want to risk myrvcg removal."
+  sleep 10
+else
+  log "Simulation shows no forced removal of myrvcg (good)."
+fi
+
+# -------------------------------
+# 6. Real upgrade to openHAB 2.5.12
+# -------------------------------
+log "Installing openhab2=2.5.12-1 and openhab2-addons=2.5.12-1 (keeping existing configs)..."
+apt-get install -y --allow-unauthenticated \
+  -o Dpkg::Options::=--force-confold \
+  openhab2=2.5.12-1 openhab2-addons=2.5.12-1
+
+log "openHAB packages installed. Clearing cache and tmp..."
+rm -rf /var/lib/openhab2/cache/* /var/lib/openhab2/tmp/* 2>/dev/null || true
+
+# -------------------------------
+# 7. Re-attach MyRV binding + LCI cloud connector from /mnt/cfile
+# -------------------------------
+ADDONS_DIR="/usr/share/openhab2/addons"
+mkdir -p "${ADDONS_DIR}"
+
+log "Searching /mnt/cfile for MyRV binding JAR..."
+MYRV_JAR="$(find /mnt/cfile -maxdepth 7 -type f -name 'org.openhab.binding.idsmyrv-*.jar' 2>/dev/null | head -n1 || true)"
+if [ -n "${MYRV_JAR}" ]; then
+  log "Found MyRV binding: ${MYRV_JAR}"
+  cp "${MYRV_JAR}" "${ADDONS_DIR}/" || warn "Failed to copy MyRV binding JAR."
+else
+  warn "Could not find org.openhab.binding.idsmyrv-*.jar under /mnt/cfile. MyRV binding may already be built-in or located elsewhere."
+fi
+
+log "Searching /mnt/cfile for custom openHAB Cloud connector JAR..."
+CLOUD_JAR="$(find /mnt/cfile -maxdepth 7 -type f -name 'org.openhab.io.openhabcloud-*.jar' 2>/dev/null | head -n1 || true)"
+if [ -n "${CLOUD_JAR}" ]; then
+  log "Found cloud connector: ${CLOUD_JAR}"
+  cp "${CLOUD_JAR}" "${ADDONS_DIR}/" || warn "Failed to copy cloud connector JAR."
+else
+  warn "Could not find org.openhab.io.openhabcloud-*.jar under /mnt/cfile. Vendor may use the stock connector or a different path."
+fi
+
+if [ -d "${ADDONS_DIR}" ]; then
+  chown -R openhab:openhab "${ADDONS_DIR}" || warn "Failed to chown addons dir; check permissions."
+fi
+
+# -------------------------------
+# 8. Restart openHAB (and myrvcg if present)
+# -------------------------------
+log "Restarting openHAB service via systemd..."
+if systemctl is-enabled openhab2 >/dev/null 2>&1 || systemctl status openhab2 >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+  systemctl restart openhab2 || warn "Failed to restart openhab2 service."
+else
+  warn "openhab2.service not found or not enabled; trying openhab-cli start in this terminal."
+  if command -v openhab-cli >/dev/null 2>&1; then
+    openhab-cli start || warn "openhab-cli start failed."
+  fi
+fi
+
+if dpkg -s myrvcg >/dev/null 2>&1; then
+  if systemctl list-unit-files | grep -q '^myrvcg\.service'; then
+    log "Restarting myrvcg service..."
+    systemctl restart myrvcg || warn "Failed to restart myrvcg service."
+  else
+    warn "myrvcg package present, but no myrvcg.service unit file found."
+  fi
+fi
+
+# -------------------------------
+# 9. HomeKit bridge (rv-homekit) service hookup (if present)
+# -------------------------------
+RVHK_DIR="/root/homekit/rv-homekit"
+RVHK_BIN="${RVHK_DIR}/rv-homekit"
+
+if [ -x "${RVHK_BIN}" ]; then
+  log "rv-homekit binary detected at ${RVHK_BIN}"
+  SERVICE_FILE="/etc/systemd/system/rv-homekit.service"
+  if [ ! -f "${SERVICE_FILE}" ]; then
+    log "Creating systemd service for rv-homekit at ${SERVICE_FILE}"
+    cat > "${SERVICE_FILE}" <<'UNIT'
+[Unit]
+Description=LCI RV HomeKit Bridge (rv-homekit)
+After=network-online.target openhab2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/homekit/rv-homekit
+ExecStart=/root/homekit/rv-homekit/rv-homekit
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload || true
+    systemctl enable rv-homekit.service || warn "Failed to enable rv-homekit.service"
+  else
+    log "rv-homekit.service already exists; leaving as-is."
+  fi
+
+  log "Restarting rv-homekit service..."
+  systemctl restart rv-homekit.service || warn "Failed to restart rv-homekit.service"
+else
+  warn "rv-homekit binary not found at ${RVHK_BIN}. HomeKit bridge will not be auto-started by this script."
+fi
+
+# -------------------------------
+# 10. Final openHAB info
+# -------------------------------
+if command -v openhab-cli >/dev/null 2>&1; then
+  log "openhab-cli info (short):"
+  openhab-cli info || warn "openhab-cli info returned an error."
+else
+  warn "openhab-cli not found."
+fi
+
+log "Upgrade complete (script perspective)."
+log "Now in a browser, open:  http://<rv-ip>:8080  and check:"
+log "  - openHAB version = 2.5.12"
+log "  - MyRV Things/Items still exist"
+log "  - Cloud connector connected (for LCI site / MyRV app)"
+log "If HomeKit was previously configured, test Siri / Home app as well."
+EOF
+
+
+
+chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh
+# sudo /root/myrv_openhab_21_to_2512_upgrade.sh
