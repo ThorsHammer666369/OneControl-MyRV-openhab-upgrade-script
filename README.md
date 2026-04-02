@@ -170,7 +170,26 @@ Keep the original full raw image untouched, and do not make the shrunk copy your
 
 After writing a shrunken image to a fresh card and booting it, use Raspberry Pi configuration to expand the filesystem back to the full size of the SD card.
 
-## How to Run the Upgrade
+## How to Get the Script Onto the Pi
+
+### Option 1: Install Directly From GitHub
+
+On the Pi, from a root shell:
+
+```bash
+curl -fsSL https://github.com/ThorsHammer666369/OneControl-MyRV-openhab-upgrade-script/releases/latest/download/myrv_openhab_21_to_2512_upgrade.sh.txt | bash
+/root/myrv_openhab_21_to_2512_upgrade.sh
+```
+
+The first command downloads the latest release asset from the public GitHub repository and writes `/root/myrv_openhab_21_to_2512_upgrade.sh`.
+
+It does not start the upgrade by itself.
+
+The second command is what actually starts the upgrade.
+
+Using the release asset URL also means GitHub can count those direct installer downloads on the release page.
+
+### Option 2: Copy And Paste Manually
 
 On the Pi, from a root shell:
 
