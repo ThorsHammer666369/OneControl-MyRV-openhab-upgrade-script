@@ -201,6 +201,14 @@ chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh
 /root/myrv_openhab_21_to_2512_upgrade.sh
 ```
 
+## Known Post-Upgrade Note
+
+The script performs a final `myrv.service` restart before it finishes.
+
+Even with that restart, some systems can still ignore the first light or switch command sent from openHAB immediately after the upgrade.
+
+If that happens, wait a few seconds for the stack to finish settling and then send the command one more time before assuming the upgrade failed.
+
 ## How to Restore
 
 ### Best Restore Method

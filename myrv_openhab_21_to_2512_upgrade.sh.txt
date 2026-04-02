@@ -158,8 +158,10 @@ restart_monit_if_present() {
 }
 
 restart_myrv_if_present() {
+  local LABEL
+  LABEL="${1:-Restarting myrv.service.}"
   if systemctl cat myrv.service >/dev/null 2>&1; then
-    log "Restarting myrv.service after openHAB restart."
+    log "${LABEL}"
     systemctl restart myrv.service || warn "Failed to restart myrv.service."
   else
     warn "myrv.service unit was not found."
@@ -543,7 +545,7 @@ sleep "${POST_OPENHAB_SETTLE}"
 
 restart_openhab_and_wait "Performing final openHAB restart after post-upgrade provisioning."
 
-restart_myrv_if_present
+restart_myrv_if_present "Restarting myrv.service after openHAB restart."
 
 if wait_for_idsmyrv; then
   log "idsmyrv bindings/items are visible through REST."
@@ -558,6 +560,8 @@ else
 fi
 
 restore_monit_openhab_watchdog_reboot
+restart_myrv_if_present "Performing final myrv.service restart before completion."
+sleep 5
 
 log "Validation summary:"
 systemctl is-active openhab2 || true
@@ -568,6 +572,9 @@ find "${OH_ADDONS}" -maxdepth 1 -type f \( -name '*.bak.*' -o -name '*.disabled.
 
 log "Upgrade script completed."
 log "Backups and quarantined files are under: ${BACKUP_ROOT}"
+log "Post-upgrade note:"
+log "  - on some systems, the first light or switch command from openHAB after the upgrade may not take effect immediately"
+log "  - if that happens, wait a few seconds for the stack to settle and try the command one more time"
 log "Rollback notes:"
 log "  - restore ${BACKUP_ROOT}/openhab2-conf.tar.gz and ${BACKUP_ROOT}/openhab2-userdata.tar.gz if needed"
 log "  - restore ${BACKUP_ROOT}/services/openhabcloud.cfg if you intentionally want the stock cloud path again"
