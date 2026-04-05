@@ -78,6 +78,10 @@ OH_LIST="/etc/apt/sources.list.d/openhab2.list"
 OH_ADDONS_CFG="${OH_SERVICES}/addons.cfg"
 OH_CLOUD_CFG="${OH_SERVICES}/openhabcloud.cfg"
 MONIT_CFG="/etc/myrvcg/monit.cfg"
+RC_LOCAL="/etc/rc.local"
+RVHK_DIR="/root/homekit/rv-homekit"
+RVHK_BIN="${RVHK_DIR}/rv-homekit"
+RVHK_SERVICE="/etc/systemd/system/rv-homekit.service"
 CUSTOM_STAGE="${BACKUP_ROOT}/custom-addons"
 QUARANTINE_DIR="${BACKUP_ROOT}/addons-quarantine"
 WAIT_TIMEOUT=180
@@ -166,6 +170,101 @@ restart_myrv_if_present() {
   else
     warn "myrv.service unit was not found."
   fi
+}
+
+disable_rv_homekit_rc_local_launch() {
+  if [ ! -f "${RC_LOCAL}" ]; then
+    return 0
+  fi
+
+  if grep -q 'rv-homekit moved to systemd' "${RC_LOCAL}" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! grep -q 'rv-homekit' "${RC_LOCAL}" 2>/dev/null; then
+    return 0
+  fi
+
+  log "Disabling rv-homekit launch from ${RC_LOCAL}."
+  backup_file "${RC_LOCAL}" "etc/rc.local"
+  awk '
+    /^[[:space:]]*#/ { print; next }
+    /rv-homekit/ { print "# rv-homekit moved to systemd; see /etc/systemd/system/rv-homekit.service"; next }
+    { print }
+  ' "${RC_LOCAL}" > "${RC_LOCAL}.new"
+  mv "${RC_LOCAL}.new" "${RC_LOCAL}"
+  chmod +x "${RC_LOCAL}"
+}
+
+configure_rv_homekit_systemd_if_present() {
+  if [ ! -x "${RVHK_BIN}" ]; then
+    log "rv-homekit binary not present; skipping HomeKit startup migration."
+    return 1
+  fi
+
+  log "Configuring rv-homekit systemd startup with openHAB readiness gate."
+  backup_file "${RVHK_SERVICE}" "systemd/rv-homekit.service"
+  disable_rv_homekit_rc_local_launch
+
+  cat > "${RVHK_SERVICE}" <<'UNIT'
+[Unit]
+Description=LCI RV HomeKit Bridge (rv-homekit)
+After=network-online.target openhab2.service
+Wants=network-online.target
+Requires=openhab2.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/homekit/rv-homekit
+ExecStartPre=/bin/bash -c 'stable=0; i=0; while [ "$i" -lt 72 ]; do if /usr/bin/curl -fsS http://127.0.0.1:8080/rest/items >/dev/null 2>&1 && /usr/bin/curl -fsS http://127.0.0.1:8080/rest/things 2>/dev/null | grep -q "idsmyrv:"; then stable=$((stable + 1)); else stable=0; fi; if [ "$stable" -ge 3 ]; then sleep 5; exit 0; fi; i=$((i + 1)); sleep 5; done; echo "openHAB/items/idsmyrv not stable after waiting 6 minutes" >&2; exit 1'
+ExecStart=/root/homekit/rv-homekit/rv-homekit
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=420
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable rv-homekit.service >/dev/null 2>&1 || warn "Failed to enable rv-homekit.service."
+  return 0
+}
+
+restart_rv_homekit_if_present() {
+  local LABEL
+  LABEL="${1:-Restarting rv-homekit.service.}"
+  if systemctl cat rv-homekit.service >/dev/null 2>&1; then
+    log "${LABEL}"
+    systemctl restart rv-homekit.service || warn "Failed to restart rv-homekit.service."
+  else
+    warn "rv-homekit.service unit was not found."
+  fi
+}
+
+wait_for_rv_homekit() {
+  local I
+  I=0
+  while [ "${I}" -lt 120 ]; do
+    if systemctl is-active rv-homekit.service >/dev/null 2>&1 && \
+       ss -ltnp 2>/dev/null | grep -q ':8081'; then
+      return 0
+    fi
+    if systemctl is-failed rv-homekit.service >/dev/null 2>&1; then
+      return 1
+    fi
+    I=$((I + 1))
+    sleep 5
+  done
+  return 1
+}
+
+reboot_pi_to_finish() {
+  log "Rebooting the Pi in 5 seconds to finish the upgrade on a clean boot."
+  log "The current shell or SSH session may disconnect when the reboot starts."
+  sleep 5
+  sync
+  nohup /sbin/reboot >/dev/null 2>&1 &
 }
 
 restart_openhab_and_wait() {
@@ -559,6 +658,15 @@ else
   fi
 fi
 
+if configure_rv_homekit_systemd_if_present; then
+  restart_rv_homekit_if_present "Starting rv-homekit under systemd."
+  if wait_for_rv_homekit; then
+    log "rv-homekit is active under systemd and listening on port 8081."
+  else
+    warn "rv-homekit did not become ready under systemd. Review journalctl -u rv-homekit.service."
+  fi
+fi
+
 restore_monit_openhab_watchdog_reboot
 restart_myrv_if_present "Performing final myrv.service restart before completion."
 sleep 5
@@ -567,6 +675,9 @@ log "Validation summary:"
 systemctl is-active openhab2 || true
 systemctl is-active mosquitto || true
 systemctl is-active myrv.service || true
+if systemctl cat rv-homekit.service >/dev/null 2>&1; then
+  systemctl is-active rv-homekit.service || true
+fi
 curl -fsS http://127.0.0.1:8080/rest/ >/dev/null 2>&1 && log "REST is responding on 127.0.0.1:8080"
 find "${OH_ADDONS}" -maxdepth 1 -type f \( -name '*.bak.*' -o -name '*.disabled.*' \) -print
 
@@ -579,6 +690,8 @@ log "Rollback notes:"
 log "  - restore ${BACKUP_ROOT}/openhab2-conf.tar.gz and ${BACKUP_ROOT}/openhab2-userdata.tar.gz if needed"
 log "  - restore ${BACKUP_ROOT}/services/openhabcloud.cfg if you intentionally want the stock cloud path again"
 log "  - restore ${BACKUP_ROOT}/myrvcg/monit.cfg if you need the previous Monit CPU watchdog"
+log "  - restore ${BACKUP_ROOT}/etc/rc.local and ${BACKUP_ROOT}/systemd/rv-homekit.service if you need the previous HomeKit startup path back"
+reboot_pi_to_finish
 EOF
 
 chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh

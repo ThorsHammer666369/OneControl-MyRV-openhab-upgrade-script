@@ -40,8 +40,10 @@ High-level behavior:
 - Restores the custom MyRV add-ons after the package upgrade.
 - Normalizes `/etc/openhab2/services/addons.cfg` so the post-upgrade package selection stays compatible with this system and preserves the stock legacy UI set (`basic`, `paper`, `habmin`, `habpanel`, plus `restdocs`) while keeping `classic` out.
 - Disables `/etc/openhab2/services/openhabcloud.cfg` if it exists, to avoid reactivating the stock cloud path when the custom cloud JAR is in use.
-- Leaves the stock `myrv.service` and `rc.local` startup behavior alone.
+- Leaves the stock `myrv.service` startup behavior alone.
+- If `rv-homekit` is present, migrates its startup from `/etc/rc.local` to `/etc/systemd/system/rv-homekit.service` with the correct working directory and an openHAB / `idsmyrv` readiness gate.
 - Restarts openHAB once for the package/config changes, waits through the post-upgrade provisioning window, then performs one final openHAB restart before restarting the stock `myrv.service`.
+- Prints a final validation summary and then reboots the Pi so the upgraded system comes back on a clean boot path.
 - Moves `/var/lib/openhab2/cache` and `/var/lib/openhab2/tmp` aside with timestamped names and recreates them empty.
 - Temporarily changes the Monit openHAB CPU rule to `alert` at `65%` during the upgrade so package churn does not reboot the Pi.
 - Restores the Monit rule to `reboot` at `65%` at the end of the script. used to be 50% but increased to 65% because openhab 2.5.12 uses more resources.
@@ -71,7 +73,9 @@ Typical contents of the restore point:
 - `openhab2-status.txt`
 - `myrv-status.txt`
 - `systemd/myrv.service`
+- `systemd/rv-homekit.service`
 - `myrvcg/monit.cfg`
+- `etc/rc.local`
 - `services/addons.cfg`
 - `services/openhabcloud.cfg`
 
@@ -93,6 +97,8 @@ Configuration and runtime changes:
 - `/etc/openhab2/services/addons.cfg`
 - `/etc/openhab2/services/openhabcloud.cfg` if present
 - `/etc/myrvcg/monit.cfg`
+- `/etc/rc.local` if `rv-homekit` is present
+- `/etc/systemd/system/rv-homekit.service` if `rv-homekit` is present
 - `/var/lib/openhab2/cache`
 - `/var/lib/openhab2/tmp`
 - `/usr/share/openhab2/addons`
@@ -203,7 +209,11 @@ chmod +x /root/myrv_openhab_21_to_2512_upgrade.sh
 
 ## Known Post-Upgrade Note
 
-The script performs a final `myrv.service` restart before it finishes.
+The script performs a final `myrv.service` restart, prints a short validation summary, and then reboots the Pi.
+
+If you are running it over SSH, expect that session to disconnect when the reboot starts.
+
+Give the Pi a few minutes to come back before testing the system.
 
 Even with that restart, some systems can still ignore the first light or switch command sent from openHAB immediately after the upgrade.
 
@@ -235,6 +245,8 @@ At minimum, review and restore as needed:
 - `openhab2-addons.tar.gz`
 - `myrvcg/monit.cfg`
 - `systemd/myrv.service`
+- `systemd/rv-homekit.service`
+- `etc/rc.local`
 - `services/addons.cfg`
 - `services/openhabcloud.cfg`
 - `custom-addons/`
